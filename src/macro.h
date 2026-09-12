@@ -19,6 +19,9 @@
 // LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
+#ifndef MACRO_H
+#define MACRO_H
+
 #include <stdint.h>
 #include <stddef.h>
 
@@ -186,4 +189,6 @@ def montgomery_mul(a_mont, b_mont, p):
         (i192)[1] -= _b;                           \
         (i192)[2] = (i192)[2] - ((j192)[2] + _b1); \
     } while (0)
+
+#endif // MACRO_H
 

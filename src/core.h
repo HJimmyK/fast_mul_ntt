@@ -20,6 +20,9 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 
+#ifndef CORE_H
+#define CORE_H
+
 #include <assert.h>
 #include <stdbool.h>
 #include <stdio.h>
@@ -512,3 +515,5 @@ define_idit(1) define_idit(2) define_idit(3)
 
 #define dif_func(in_out, table, len, _i) dif_##_i(in_out, table, len)
 #define idit_func(in_out, table, len, _i) idit_##_i(in_out, table, len)
+
+#endif // CORE_H

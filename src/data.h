@@ -20,6 +20,9 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 
+#ifndef DATA_H
+#define DATA_H
+
 #include "macro.h"
 
 /* 全局静态变量获取 */
@@ -152,3 +155,5 @@ const mont64 global_w3_inv3 = 3721808940232232516ull;
 const mont64 global_one1 = 1044835113549955065ull;
 const mont64 global_one2 = 936748722493063159ull;
 const mont64 global_one3 = 1729382256910270460ull;
+
+#endif // DATA_H
