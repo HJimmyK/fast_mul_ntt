@@ -1,11 +1,16 @@
-// fft_small 移植版的公共定义
+// fsd.h —— fft_small 移植版的内部公共定义（不属于公开接口）
+//
+// ★ 本头文件只供 fft_small 模块自身的 .c 文件（以及 fsd_test.c 自测）使用，
+//   库的使用者只应包含 fft_small.h（见其中的 abs_mul64 / abs_sqr64）。
+//   除 fft_small.h 声明的符号外，本模块其余函数均为内部实现细节，
+//   单个 .c 文件内使用的函数一律 static，跨文件的内部函数集中声明于本文件。
 //
 // 模块概览（详见各 .c 文件）：
-//   sd_fft_ctx   一个 ~50 bit NTT 素数的旋转因子表等上下文
-//   sd_fft_trunc 截断正变换（DIF，输出按位翻转序）
-//   sd_ifft_trunc 截断逆变换（输出 = 2^L * 原序列）
-//   mpn_ctx      8 个素数 + CRT 数据 + 2 的幂表 + 尺寸方案表
-//   mpn_ctx_mpn_mul  大整数乘法主流程（limb 数组 -> FFT -> 点乘 -> CRT）
+//   sd_fft_ctx        单个 ~50 bit NTT 素数的上下文（旋转因子表等）
+//   sd_fft_trunc      截断正变换（DIF，输出按位翻转序）
+//   sd_ifft_trunc     截断逆变换（输出 = 2^L * 原序列）
+//   mpn_ctx           8 个素数 + CRT 数据 + 2 的幂表 + 尺寸方案表
+//   mpn_ctx_mpn_mul   大整数乘法主流程（limb 数组 -> FFT -> 点乘 -> CRT）
 
 #ifndef FSD_H
 #define FSD_H
@@ -29,14 +34,13 @@ typedef unsigned long long u64;
 
 #define VEC_SZ 4
 
-/* 拼接宏 */
+/* 标识拼接宏：CAT(vec4d, add) 展开为 vec4d_add */
 #define CAT_(a, b) a##_##b
 #define CAT(a, b) CAT_(a, b)
 #define CAT3_(a, b, c) a##_##b##_##c
 #define CAT3(a, b, c) CAT3_(a, b, c)
 #define CAT4_(a, b, c, d) a##_##b##_##c##_##d
 #define CAT4(a, b, c, d) CAT4_(a, b, c, d)
-#define TEMPLATE(T, op) CAT(T, op)
 
 #if defined(__GNUC__)
 #define FSD_UNUSED(x) __attribute__((unused)) x
@@ -45,13 +49,16 @@ typedef unsigned long long u64;
 #endif
 
 #ifdef NDEBUG
+/* 发布版：把断言编译成不求值的表达式（保留对表达式的语法检查） */
 #define FSD_ASSERT(x) ((void)sizeof(!(x) ? 1 : 0))
 #else
 #define FSD_ASSERT(x) assert(x)
 #endif
 
+/* 出错即终止（打印消息后 abort） */
 void fsd_abort(const char* msg);
 
+/* 对齐内存分配（Windows 用 _aligned_malloc，其余用 C11 aligned_alloc） */
 void* fsd_aligned_alloc(size_t align, size_t size);
 void fsd_aligned_free(void* p);
 
@@ -61,6 +68,7 @@ void fsd_aligned_free(void* p);
 
 static inline ulong n_pow2(ulong k) { return UWORD(1) << k; }
 
+/* 有效位数：n_nbits(x) = floor(log2(x)) + 1，x == 0 时为 0 */
 static inline ulong n_nbits(ulong x) { return x == 0 ? 0 : (ulong)(64 - __builtin_clzll(x)); }
 
 static inline ulong n_trailing_zeros(ulong x) { return x == 0 ? 0 : (ulong)__builtin_ctzll(x); }
@@ -68,11 +76,12 @@ static inline ulong n_trailing_zeros(ulong x) { return x == 0 ? 0 : (ulong)__bui
 static inline ulong n_min(ulong x, ulong y) { return x < y ? x : y; }
 static inline ulong n_max(ulong x, ulong y) { return x > y ? x : y; }
 
+/* 向上取整除法与向上取整 log2 */
 static inline ulong n_cdiv(ulong a, ulong b) { return (a + b - 1) / b; }
 static inline ulong n_clog2(ulong x) { return x <= 1 ? 0 : n_nbits(x - 1); }
 static inline ulong n_round_up(ulong x, ulong y) { return y * n_cdiv(x, y); }
-static inline ulong n_nbits_1(ulong x) { return n_nbits(x); }
 
+/* 取 x 的低 len 位并反转（位翻转序，len 为位数） */
 static inline ulong n_revbin(ulong x, ulong len) {
     ulong r = 0;
     for (ulong i = 0; i < len; i++) {
@@ -82,6 +91,7 @@ static inline ulong n_revbin(ulong x, ulong len) {
     return r;
 }
 
+/* 64x64 -> 128 位乘法，返回 (hi, lo) */
 #define umul_ppmm(hi, lo, a, b)               \
     do {                                      \
         unsigned __int128 _p =                \
@@ -93,7 +103,7 @@ static inline ulong n_revbin(ulong x, ulong len) {
 /************************* nmod / 素数 **************************************/
 
 #if defined(_MSC_VER)
-#include <intrin.h> /* __cpuid */
+#include <intrin.h> /* fft_small.c 的 __cpuid 需要 */
 #endif
 
 /* 128 位除以 64 位（要求 hi < d），逐位长除法。
@@ -125,26 +135,28 @@ static inline ulong nmod_mul(ulong a, ulong b, nmod_t mod) {
     return rem;
 }
 
+/* (hi*2^64 + lo) mod mod.n，要求 hi < mod.n（内部经 fsd_udiv128 逐位除） */
 static inline ulong nmod_red2(ulong hi, ulong lo, nmod_t mod) {
     ulong rem;
     (void)fsd_udiv128(hi, lo, mod.n, &rem);
     return rem;
 }
 
-#define NMOD_RED2(r, hi, lo, mod) ((r) = nmod_red2((hi), (lo), (mod)))
-
 ulong nmod_pow_ui(ulong a, ulong exp, nmod_t mod);
-/* mod.n 为素数 */
+/* mod.n 为素数，用费马小定理求逆 */
 static inline ulong nmod_inv(ulong a, nmod_t mod) { return nmod_pow_ui(a, mod.n - 2, mod); }
 
+/* 确定性 Miller-Rabin 素性检测（对 2^64 以内全部有效） */
 int n_is_prime(ulong n);
+/* 求模 p 的一个二次非剩余（用于构造 2 的幂次本原根） */
 ulong n_quadratic_nonresidue(ulong p);
 
-/* 检验素数能否用于 double 域模乘（见 fsd_fft_ctx.c 的误差分析） */
+/* 检验素数能否用于 double 域模乘（见 fsd_mpn.c 的误差分析） */
 int fft_small_mulmod_satisfies_bounds(ulong nn);
 
 /************************* mpn 小函数 ***************************************/
 
+/* rp[0..n) = xp[0..n) * limb + 进位，返回最高进位 */
 ulong fsd_mpn_mul_1(ulong* rp, const ulong* xp, ulong n, ulong limb);
 ulong fsd_mpn_add_n(ulong* rp, const ulong* xp, const ulong* yp, ulong n);
 ulong fsd_mpn_sub_n(ulong* rp, const ulong* xp, const ulong* yp, ulong n);
@@ -156,10 +168,8 @@ void fsd_mpn_divexact_1(ulong* rp, const ulong* xp, ulong n, ulong d);
 
 #define flint_mpn_copyi(dst, src, n) memcpy((dst), (src), (n) * sizeof(ulong))
 
-ulong flint_mpn_nbits(const ulong* a, ulong an);
-/* cmp(a, b*2^e)，a 不必规范化 */
+/* cmp(a, b*2^e)，a 不必规范化（用于校验 CRT 素数乘积是否足够大） */
 int flint_mpn_cmp_ui_2exp(const ulong* a, ulong an, ulong b, ulong e);
-unsigned char flint_mpn_add_inplace_c(ulong* z, ulong zn, ulong* a, ulong an, unsigned char cf);
 
 /* 带进位加，编译器可识别为 adc 模式 */
 static inline unsigned char _addcarry_ulong(unsigned char cf, ulong x, ulong y, ulong* sum) {
@@ -180,8 +190,8 @@ static inline unsigned char _addcarry_ulong(unsigned char cf, ulong x, ulong y, 
 #define SD_FFT_CTX_W2TAB_SIZE 50
 
 typedef struct sd_fft_ctx_struct {
-    double p;    /* 素数 */
-    double pinv; /* 1/p */
+    double p;    /* 素数（以 double 精确表示） */
+    double pinv; /* 1/p（就近舍入的 double） */
     nmod_t mod;
     ulong primitive_2power_root;
     /* w2tab[k] 是长 2^(k-1)（k>=1）的 2^(k+1) 次单位根表，按 revbin 排列；
@@ -192,6 +202,7 @@ typedef struct sd_fft_ctx_struct {
 
 typedef sd_fft_ctx_struct sd_fft_ctx_t[1];
 
+/* 第 I 块的起始下标 / 指针；深度 depth 的变换共 n_pow2(depth) 个 double */
 #define sd_fft_ctx_blk_offset(I) ((I)*BLK_SZ)
 #define sd_fft_ctx_blk_index(ptr, I) ((ptr) + sd_fft_ctx_blk_offset(I))
 #define sd_fft_ctx_data_size(depth) n_pow2(depth)
@@ -215,14 +226,12 @@ static inline double sd_fft_ctx_w2(const sd_fft_ctx_t Q, ulong j) {
 
 void sd_fft_ctx_init_prime(sd_fft_ctx_t Q, ulong pp);
 void sd_fft_ctx_clear(sd_fft_ctx_t Q);
+/* 保证 w2tab 已建到 depth 层（不足则现场扩展） */
 void sd_fft_ctx_fit_depth(sd_fft_ctx_t Q, ulong depth);
-void sd_fft_ctx_fit_depth_with_lock(sd_fft_ctx_t Q, ulong depth);
 
+/* 截断正 / 逆变换（内部于 fsd_fft.c / fsd_ifft.c） */
 void sd_fft_trunc(sd_fft_ctx_t Q, double* d, ulong L, ulong itrunc, ulong otrunc);
 void sd_ifft_trunc(sd_fft_ctx_t Q, double* d, ulong L, ulong trunc);
-
-void sd_fft_ctx_point_mul(const sd_fft_ctx_t Q, double* a, const double* b, ulong m, ulong depth);
-void sd_fft_ctx_point_sqr(const sd_fft_ctx_t Q, double* a, ulong m, ulong depth);
 
 /************************* crt_data ****************************************/
 
@@ -236,18 +245,11 @@ typedef struct {
 
 typedef crt_data_struct crt_data_t[1];
 
-void crt_data_init(crt_data_t C, ulong prime, ulong coeff_len, ulong nprimes);
-void crt_data_clear(crt_data_t C);
-
 static inline ulong* crt_data_co_prime(crt_data_t C, ulong i) { return C->data + i * C->coeff_len; }
 static inline ulong* crt_data_prod_primes(crt_data_t C) { return C->data + C->nprimes * C->coeff_len; }
 static inline ulong* crt_data_co_prime_red(crt_data_t C, ulong i) {
     return crt_data_prod_primes(C) + C->coeff_len + i;
 }
-
-/************************* crt 辅助（对应 crt_helpers.h，见 fsd_crt.h） *****/
-
-void _convert_block(ulong* Xs, sd_fft_ctx_struct* Rffts, double* d, ulong dstride, ulong np, ulong I);
 
 /************************* mpn_ctx *****************************************/
 
@@ -259,6 +261,7 @@ typedef void (*to_ffts_func)(sd_fft_ctx_struct* Rffts, double* d, ulong dstride,
                              const ulong* a, ulong an, ulong atrunc, const vec4d* two_pow,
                              ulong start_easy, ulong stop_easy, ulong start_hard, ulong stop_hard);
 
+/* 一个尺寸方案：np 个素数、每组 bits 位、较短操作数上限 bn_bound */
 typedef struct {
     ulong np;
     ulong bits;
@@ -282,10 +285,10 @@ typedef mpn_ctx_struct mpn_ctx_t[1];
 
 void mpn_ctx_init(mpn_ctx_t R, ulong p);
 void mpn_ctx_clear(mpn_ctx_t R);
-void* mpn_ctx_fit_buffer(mpn_ctx_t R, ulong n);
 /* z = a * b，z 需要能容纳 an+bn 个 limb；a 与 b 可以是同一块内存（此时走平方路径） */
 void mpn_ctx_mpn_mul(mpn_ctx_t R, ulong* z, const ulong* a, ulong an, const ulong* b, ulong bn);
 
+/* CRT 大数乘加 / 缩减模板（multi_add / _big_mul / _reduce_big_sum） */
 #include "fsd_crt.h"
 
 #ifdef __cplusplus

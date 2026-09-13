@@ -24,7 +24,9 @@
 #include <stdio.h>
 #include "fsd.h"
 
-void crt_data_init(crt_data_t C, ulong prime, ulong coeff_len, ulong nprimes) {
+/* ---------------- CRT 数据的建立与释放（仅本文件使用） ---------------- */
+
+static void crt_data_init(crt_data_t C, ulong prime, ulong coeff_len, ulong nprimes) {
     C->prime = prime;
     C->coeff_len = coeff_len;
     C->nprimes = nprimes;
@@ -33,12 +35,14 @@ void crt_data_init(crt_data_t C, ulong prime, ulong coeff_len, ulong nprimes) {
         fsd_abort("内存分配失败");
 }
 
-void crt_data_clear(crt_data_t C) {
+static void crt_data_clear(crt_data_t C) {
     free(C->data);
 }
 
 /*
-    need  ceil(64*bn/bits) <= prod_primes/2^(2*bits)
+    计算 profile 的 bn 上限：需要 ceil(64*bn/bits) <= prod_primes/2^(2*bits)。
+    也就是让 (prod - 2^(2*bits)) >> 6 仍在 coeff_len 个 limb 内可表示，
+    返回该上限值（溢出时返回 ULONG_MAX）。
 */
 static ulong crt_data_find_bn_bound(const crt_data_t C, ulong bits) {
     ulong bound = 0;
@@ -181,7 +185,8 @@ DEFINE_IT(8)
 
 #define N_CDIV(a, b) (((a) + (b) - 1) / (b))
 
-/* 简单区段：start/stop 已保证读 a 不越界，可无检查展开 */
+/* 把输入 limb 数组按 bits 位一组切成系数，转成 np 个素数上的 double 剩余。
+   easy 区段：start/stop 已保证读 a 不越界，可无检查展开 */
 #define DEFINE_IT(NP, BITS) \
 static void CAT3(mpn_to_ffts, NP, BITS)( \
     sd_fft_ctx_struct* Rffts, double* d, ulong dstride, \
@@ -271,6 +276,9 @@ DEFINE_IT(8,192)
 #undef N_CDIV
 
 
+/* CRT 重构时把 FFT 结果累加进输出 z：
+   easy 路径（toff+n <= zn，完整 multi_add 即可）与
+   hard 路径（写尾部时可能只剩不足 n 个 limb，退化为 fsd_mpn_add_n） */
 #define DEFINE_IT(n, n_plus_1) \
 static inline void CAT(_add_to_answer_easy, n)(ulong z[], ulong r[], ulong FSD_UNUSED(zn), ulong toff, ulong tshift) \
 { \
@@ -320,6 +328,43 @@ DEFINE_IT(5, 6)
 DEFINE_IT(6, 7)
 DEFINE_IT(7, 8)
 #undef DEFINE_IT
+
+/* 把第 l 个素数在 d + l*dstride 处第 I 块的 FFT 值规约到 [0, p)，
+   转成整数并写入 Xs + l*BLK_SZ（供 CRT 重构使用） */
+static void _convert_block(
+    ulong* Xs,
+    sd_fft_ctx_struct* Rffts, double* d, ulong dstride,
+    ulong np,
+    ulong I)
+{
+    for (ulong l = 0; l < np; l++)
+    {
+        vec4d p = vec4d_set_d(Rffts[l].p);
+        vec4d pinv = vec4d_set_d(Rffts[l].pinv);
+        double* x = sd_fft_ctx_blk_index(d + l*dstride, I);
+        ulong j = 0; do {
+            vec4d x0, x1, x2, x3;
+            vec4n y0, y1, y2, y3;
+            x0 = vec4d_load(x + j + 0*VEC_SZ);
+            x1 = vec4d_load(x + j + 1*VEC_SZ);
+            x2 = vec4d_load(x + j + 2*VEC_SZ);
+            x3 = vec4d_load(x + j + 3*VEC_SZ);
+            x0 = vec4d_reduce_to_0n(x0, p, pinv);
+            x1 = vec4d_reduce_to_0n(x1, p, pinv);
+            x2 = vec4d_reduce_to_0n(x2, p, pinv);
+            x3 = vec4d_reduce_to_0n(x3, p, pinv);
+            y0 = vec4d_convert_limited_vec4n(x0);
+            y1 = vec4d_convert_limited_vec4n(x1);
+            y2 = vec4d_convert_limited_vec4n(x2);
+            y3 = vec4d_convert_limited_vec4n(x3);
+            vec4n_store_unaligned(Xs + l*BLK_SZ + j + 0*VEC_SZ, y0);
+            vec4n_store_unaligned(Xs + l*BLK_SZ + j + 1*VEC_SZ, y1);
+            vec4n_store_unaligned(Xs + l*BLK_SZ + j + 2*VEC_SZ, y2);
+            vec4n_store_unaligned(Xs + l*BLK_SZ + j + 3*VEC_SZ, y3);
+        } while (j += 4*VEC_SZ, j < BLK_SZ);
+        FSD_ASSERT(j == BLK_SZ);
+    }
+}
 
 typedef void (*from_ffts_func)(
     ulong* z, ulong zn, ulong zlen,
@@ -426,9 +471,8 @@ DEFINE_IT(8, 7, 6)
 #undef DEFINE_IT
 
 /*
-    Specialized helper function, currently only called from mpn_ctx_init.
-    Assume p is odd and p - 1 has high 2-valuation, return some number q
-    (not necessarily prime) such that q - 1 also has high 2-valuation.
+    仅供 mpn_ctx_init 使用的辅助函数：给定奇数 p（p-1 的 2 进制赋值很高），
+    返回下一个候选 FFT 数 q（不必是素数），且 q-1 也有较高的 2 进制赋值。
 */
 static ulong next_fft_number(ulong p) {
     ulong bits, l, q;
@@ -438,18 +482,17 @@ static ulong next_fft_number(ulong p) {
     if (bits < 15)
         fsd_abort("next_fft_number: 输入过小");
     if (n_nbits(q) == bits)
-        /* Best case: q - 1 has the same bit length and 2-valuation as p - 1 */
+        /* 最好：q-1 与 p-1 位数相同、2 进制赋值相同 */
         return q;
     if (l < 5)
-        return n_pow2(bits - 2) + 1;  /* Worst case: drop the bit length by 1 */
-    /* Second-best case: keep the bit length, but drop the 2-valuation by 1 */
-    /* (this is the only case where q > p) */
+        return n_pow2(bits - 2) + 1;  /* 最差：位数掉 1（ Fermat 型数） */
+    /* 次优：保持位数，2 进制赋值降 1（唯一可能 q > p 的分支） */
     return n_pow2(bits) - n_pow2(l - 1) + 1;
 }
 
 /*
-    fill in  d[i*nvs + k/VEC_SZ][k%VEC_SZ] = 2^i mod Rffts[k].p
-    for 0 <= k < VEC_SZ*nvs and 0 <= i < len.
+    填充 2 的幂表：x[i*nvs + l] 的第 k 路为 2^i mod Rffts[4*l+k].p
+    （0 <= l < nvs，0 <= i < len）。输入切分的移位乘法用它代替取模。
 */
 static void fill_vec_two_pow_tab(
     vec4d* x,
@@ -617,48 +660,40 @@ void mpn_ctx_clear(mpn_ctx_t R)
     fsd_aligned_free(R->buffer);
 }
 
+/*
+    为 an x bn 的乘法挑选尺寸方案，返回选中的 profile 下标。
 
-typedef struct {
-    ulong np;
-    ulong bits;
-    to_ffts_func to_ffts;
-} profile_entry;
-
-static void mpn_ctx_best_profile(
-    const mpn_ctx_t R,
-    profile_entry* P,
-    ulong an, ulong bn)
+    profiles 按 np 分组（4..8），组内 bits 递增、bn_bound 递减。
+    每组中取「bits 最大且 bn_bound 仍能容纳 bn」的一项作为候选，
+    以 score = np * depth * ztrunc * (1 - 0.25*零填充占比) 估计总计算量，
+    取 score 最小的候选。（冷路径，每次乘法只调用一次）
+*/
+static ulong mpn_ctx_best_profile(const mpn_ctx_t R, ulong an, ulong bn)
 {
-    ulong i = 0;
     ulong best_i = 0;
-    double best_score = 100000000.0*(an + bn);
+    double best_score = 1e300;
 
-    /* 单线程：nthreads = 1，所有 np 都可整除，无需线程相关的取舍 */
-
-    /*
-        The first profile is supposed to have the biggest bn_bound. If the
-        given bn is too large, there is no fast mod function.
-    */
-    if (bn > R->profiles[i].bn_bound)
+    /* profiles[0] 的 bn_bound 全表最大；连它都装不下说明操作数超限 */
+    if (bn > R->profiles[0].bn_bound)
         fsd_abort("操作数过长：超过 fft_small 支持的最大 limb 数（约 2.5e9）");
 
-got_one:
-
-    /* maximize R->profiles[i].bits */
-
-    FSD_ASSERT(i < R->profiles_size);
-    FSD_ASSERT(bn <= R->profiles[i].bn_bound);
-
-    while (i+1 < R->profiles_size &&
-           bn <= R->profiles[i+1].bn_bound &&
-           R->profiles[i+1].np == R->profiles[i].np)
+    for (ulong i = 0; i < R->profiles_size; )
     {
-        i++;
-    }
+        if (bn > R->profiles[i].bn_bound)
+        {
+            i++; /* 组内 bound 只减不增，装不下就跳过这一项 */
+            continue;
+        }
 
-    {
-        ulong np = R->profiles[i].np;
-        ulong bits = R->profiles[i].bits;
+        /* 组内推进到 bits 最大且仍能容纳 bn 的 profile */
+        ulong j = i;
+        while (j + 1 < R->profiles_size &&
+               R->profiles[j + 1].np == R->profiles[i].np &&
+               bn <= R->profiles[j + 1].bn_bound)
+            j++;
+
+        ulong np = R->profiles[j].np;
+        ulong bits = R->profiles[j].bits;
         ulong alen = n_cdiv(64*an, bits);
         ulong blen = n_cdiv(64*bn, bits);
         ulong zlen = alen + blen - 1;
@@ -671,28 +706,18 @@ got_one:
         score *= ztrunc;
         if (score < best_score)
         {
-            best_i = i;
+            best_i = j;
             best_score = score;
         }
+
+        i = j + 1; /* 跳到下一个 np 组 */
     }
 
-find_next:
-
-    do {
-        i++;
-        if (i >= R->profiles_size)
-        {
-            P->np = R->profiles[best_i].np;
-            P->bits = R->profiles[best_i].bits;
-            P->to_ffts = R->profiles[best_i].to_ffts;
-            return;
-        }
-    } while (bn > R->profiles[i].bn_bound);
-
-    goto got_one;
+    return best_i;
 }
 
-void* mpn_ctx_fit_buffer(mpn_ctx_t R, ulong n) {
+/* 保证 R->buffer 至少 n 字节；按 17/16 比例增长以均摊 realloc（仅本文件使用） */
+static void* mpn_ctx_fit_buffer(mpn_ctx_t R, ulong n) {
     if (n > R->buffer_alloc)
     {
         fsd_aligned_free(R->buffer);
@@ -705,8 +730,9 @@ void* mpn_ctx_fit_buffer(mpn_ctx_t R, ulong n) {
     return R->buffer;
 }
 
-/* pointwise mul of a with b and m */
-void sd_fft_ctx_point_mul(
+/* 点乘：a <- a * b * m，按块（BLK_SZ）用 vec8d 处理（仅本文件使用）。
+   m 已吸收 CRT 修正因子与 2^-depth 的逆，使 IFFT 输出直接是卷积系数 */
+static void sd_fft_ctx_point_mul(
     const sd_fft_ctx_t Q,
     double* a,
     const double* b,
@@ -737,7 +763,8 @@ void sd_fft_ctx_point_mul(
     }
 }
 
-void sd_fft_ctx_point_sqr(
+/* 平方专用的点乘：a <- a^2 * m（省掉一次正变换，仅本文件使用） */
+static void sd_fft_ctx_point_sqr(
     const sd_fft_ctx_t Q,
     double* a,
     ulong m_,
@@ -770,13 +797,13 @@ void mpn_ctx_mpn_mul(mpn_ctx_t R, ulong* z, const ulong* a, ulong an, const ulon
 {
     ulong zn, alen, blen, zlen, atrunc, btrunc, ztrunc, depth, stride;
     double* abuf;
-    profile_entry P;
+    profile_struct P;
     int squaring;
 
     FSD_ASSERT(an > 0);
     FSD_ASSERT(bn > 0);
 
-    mpn_ctx_best_profile(R, &P, an, bn);
+    P = R->profiles[mpn_ctx_best_profile(R, an, bn)];
 
     squaring = (a == b) && (an == bn);
     zn = an + bn;
@@ -835,9 +862,12 @@ void mpn_ctx_mpn_mul(mpn_ctx_t R, ulong* z, const ulong* a, ulong an, const ulon
                 sd_fft_trunc(Q, bbuf + l*stride, depth, btrunc, ztrunc);
 
             sd_fft_trunc(Q, abuf + l*stride, depth, atrunc, ztrunc);
-            NMOD_RED2(m, *crt_data_co_prime_red(R->crts + P.np - 1, l) >> (64 - depth),
-                      *crt_data_co_prime_red(R->crts + P.np - 1, l) << depth, Q->mod);
-            m = nmod_inv(m, Q->mod);
+            /* m = (red * 2^depth)^-1 mod p：把 CRT 余因子的缩放与
+               IFFT 固有的 2^L 因子一并折进点乘 */
+            {
+                ulong red = *crt_data_co_prime_red(R->crts + P.np - 1, l);
+                m = nmod_inv(nmod_red2(red >> (64 - depth), red << depth, Q->mod), Q->mod);
+            }
 
             if (squaring)
                 sd_fft_ctx_point_sqr(Q, abuf + l*stride, m, depth);

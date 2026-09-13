@@ -22,6 +22,8 @@ target_link_libraries(bench PRIVATE fast_mul)
 target_compile_options(bench PRIVATE -ffast-math -fomit-frame-pointer)
 
 # ---------------- fft_small：FLINT 移植 ----------------
+# 对外接口只有 fft_small.h（abs_mul64 / abs_sqr64 / fft_small_init / fft_small_clear），
+# 其余 fsd_*.c/h 均为模块内部实现。
 
 add_library(fft_small STATIC
     fft_small/fft_small.c
@@ -29,7 +31,6 @@ add_library(fft_small STATIC
     fft_small/fsd_fft_ctx.c
     fft_small/fsd_fft.c
     fft_small/fsd_ifft.c
-    fft_small/fsd_helpers.c
     fft_small/fsd_mpn_mul.c)
 target_include_directories(fft_small PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/fft_small)
 # 需要 AVX2 + FMA；严禁 -ffast-math（FFT 的浮点模乘依赖严格的舍入语义）

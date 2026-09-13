@@ -1,10 +1,18 @@
+// 截断正变换 sd_fft_trunc（DIF，输出按位翻转序）
+//
+// 移植自 FLINT src/fft_small/sd_fft.c（LGPL-3.0-or-later）。
+// 数据按 256 个 double 一块（BLK_SZ）组织：块内走基 2/4 的小变换
+// （basecase），块间走四步分解的递归层（先列后行），配合扭转参数 j。
+// 截断（itrunc/otrunc）用于跳过零填充区与不需要的输出，见文末
+// sd_fft_trunc 的接口说明。
+
 #include "fsd.h"
 
 #define N 8
 #define VECND vec8d
 #define VECNOP(op) CAT(VECND, op)
 
-/********************* forward butterfly **************************************
+/***************************** 正向蝶形 **************************************
     b0 = a0 + w*a1
     b1 = a0 - w*a1
 */
@@ -40,7 +48,7 @@
     CAT(V, store)(X1, CAT(V, sub)(x0, x1)); \
 }
 
-/**************** forward butterfly with truncation **************************/
+/**************** 带截断的正向蝶形：只写回 X0（otrunc < itrunc 的场合）******/
 
 #define RADIX_2_FORWARD_MOTH_TRUNC_2_1_J_IS_Z(V, X0, X1) \
 { \
@@ -62,13 +70,13 @@
     CAT(V, store)(X0, CAT(V, add)(x0, x1)); \
 }
 
-/********************* forward butterfly **************************************
+/***************************** 正向基 4 蝶形 **********************************
     b0 = a0 + w^2*a2 +   w*(a1 + w^2*a3)
     b1 = a0 + w^2*a2 -   w*(a1 + w^2*a3)
     b2 = a0 - w^2*a2 + i*w*(a1 - w^2*a3)
     b3 = a0 - w^2*a2 - i*w*(a1 - w^2*a3)
 
-    In other words: a 2-layer transform.
+    即两层基 2 蝶形的复合。
 */
 
 #define RADIX_4_FORWARD_PARAM_J_IS_Z(V, Q) \
@@ -136,6 +144,8 @@
     CAT(V, store)(X3, x3); \
 }
 
+/* 寄存器内的 4 点小变换（j 任意）：w2 = w^2，w、iw = ±w。
+   输入 x0 未规约时先做 reduce_to_pm1n */
 #define LENGTH4_ANY_J(T, x0, x1, x2, x3, n, ninv, w2, w, iw) \
 { \
     T X0 = x0, X1 = x1, X2 = x2, X3 = x3, Y0, Y1, Y2, Y3; \
@@ -154,6 +164,8 @@
     x3 = T##_##sub(Y2, Y3); \
 }
 
+/* 寄存器内的 4 点小变换（j = 0）：扭转全部是单位根的特殊值，
+   省掉两次 mulmod（用 reduce + 一次乘 i 代替） */
 #define LENGTH4_ZERO_J(T, x0, x1, x2, x3, n, ninv, e14) \
 { \
     T X0 = x0, X1 = x1, X2 = x2, X3 = x3, Y0, Y1, Y2, Y3; \
@@ -172,8 +184,8 @@
     x3 = T##_##sub(Y2, Y3); \
 }
 
-/* A 3-layer transform. */
-
+/* 寄存器内的 8 点小变换（j 任意）：三层结构，先按 w2 分四对，
+   再按 w/iw 组合，最后每路乘自己的扭转 ww0..ww3 */
 #define LENGTH8_ANY_J(T, x0, x1, x2, x3, x4, x5, x6, x7, n, ninv, w2, w, iw, ww0, ww1, ww2, ww3) \
 { \
     T X0 = x0, X1 = x1, X2 = x2, X3 = x3, X4 = x4, X5 = x5, X6 = x6, X7 = x7; \
@@ -222,6 +234,7 @@
     x7 = T##_##sub(Z6, Z7); \
 }
 
+/* 寄存器内的 8 点小变换（j = 0）：第一层只有 ±，用 reduce 代替 mulmod */
 #define LENGTH8_ZERO_J(T, x0, x1, x2, x3, x4, x5, x6, x7, n, ninv, e14, e18, e38) \
 { \
     T X0 = x0, X1 = x1, X2 = x2, X3 = x3, X4 = x4, X5 = x5, X6 = x6, X7 = x7; \
@@ -258,16 +271,20 @@
 }
 
 
-/**************** basecase transform of size 2^m **********************/
-/* template<int m, bool j_is_zero> sd_fft_basecase(Q, X, j_r, j_bits)
+/**************** 长度 2^m 的 basecase 变换（块内小变换） ******************/
+/* 模板<层数 m, j 是否为 0> sd_fft_basecase(Q, X, j_r, j_bits)
 
-    With notation as above: sd_fft_basecase_{m} performs a contiguous m-layer
-    transform with lengths (2^m, 2^(m-1), ..., 2^1).  */
+   记号同上：sd_fft_basecase_{m} 就地完成连续 m 层变换，
+   各层长度依次为 (2^m, 2^(m-1), ..., 2^1)。j_r/j_bits 描述块的整体扭转 j。
+   m <= 3 用标量（vec1d），m = 4、5 用 vec4d（4x4 转置配合），
+   m >= 6 由 EXTEND_BASECASE 递归生成。 */
 
+/* 长度 1：空操作 */
 static void sd_fft_basecase_0_1(const sd_fft_ctx_t FSD_UNUSED(Q), double* FSD_UNUSED(X)) {
 }
 
 static void sd_fft_basecase_1_1(const sd_fft_ctx_t Q, double* X) {
+    /* 长度 2：单个基 2 蝶形 */
     double n    = Q->p;
     double ninv = Q->pinv;
     double x0 = vec1d_reduce_to_pm1n(X[0], n, ninv);
@@ -288,7 +305,9 @@ static void sd_fft_basecase_3_1(const sd_fft_ctx_t Q, double* X) {
 }
 
 
-/* missing final transpose gives length >= 16 a worse-than-bit-reversed order */
+/* 长度 16（m=4, j=0）：两次 4x4 小变换夹一次转置。
+   最后的转置被省略，因此长度 >= 16 的输出序比位翻转序更乱——
+   上层调用方都按同样的约定使用，见 m=5 处的说明 */
 static void sd_fft_basecase_4_1(const sd_fft_ctx_t Q, double* X) {
     vec4d n    = vec4d_set_d(Q->p);
     vec4d ninv = vec4d_set_d(Q->pinv);
@@ -349,14 +368,13 @@ static void sd_fft_basecase_4_0(const sd_fft_ctx_t Q, double* X, ulong j_r, ulon
 }
 
 /*
-The length 32 transform can be broken up as
-   (a) 8 transforms of length 4 within columns, followed by 4 transforms of length 8 in the rows, or
-   (b) 4 transforms of length 8 within columns, followed by 8 transforms of length 4 in the rows
-Since the length 16 basecase is missing the final 4x4 transpose, so the output
-is worse than bit-reversed. If the length 32 transform used a order different from 16's,
-then we will have a problem at a higher level since it would be difficult to keep track
-of what basecase happened to have been used. Therefore, the length 16 and 32 basecases
-should produce the same order, and this is easier with (b).
+长度 32 的变换有两种拆法：
+   (a) 列方向 8 个长度 4 的变换 + 行方向 4 个长度 8 的变换，或
+   (b) 列方向 4 个长度 8 的变换 + 行方向 8 个长度 4 的变换
+长度 16 的 basecase 少做了最后一次 4x4 转置，输出序比位翻转序更乱。
+若长度 32 使用的序与 16 不同，上层就难以统一追踪各块到底用了哪种
+basecase。因此 16 与 32 必须产生相同的序，而 (b) 更容易做到这一点。
+（实现顺序：先 8 点（LENGTH8）再转置再 4 点（LENGTH4），与 (b) 等价。）
 */
 static void sd_fft_basecase_5_1(const sd_fft_ctx_t Q, double* X) {
     vec4d n    = vec4d_set_d(Q->p);
@@ -461,7 +479,9 @@ static void sd_fft_basecase_5_0(const sd_fft_ctx_t Q, double* X, ulong j_r, ulon
 }
 
 
-/* use with n = m-2 and m >= 6 */
+/* 由 n = m-2 层的 basecase 递推 m 层（m >= 6）：
+   先做一层基 4 蝶形（把 2^m 分成 4 段 2^(m-2)），
+   再对四段分别递归，扭转 j 变为 4j+{0,1,2,3} */
 #define EXTEND_BASECASE(n, m) \
 static void CAT3(sd_fft_basecase, m, 1)(const sd_fft_ctx_t Q, double* X) \
 { \
@@ -493,10 +513,10 @@ EXTEND_BASECASE(6, 8)
 EXTEND_BASECASE(7, 9)
 #undef EXTEND_BASECASE
 
-/* The `sd_fft_base_{m}_*` functions take `j`, unlike `sd_fft_basecase_{m}_*`
-   which takes `j_r` and `j_bits` (or nothing, if `j` is zero).  */
+/* `sd_fft_base_{m}_*` 系列直接接收扭转 j；
+   而 `sd_fft_basecase_{m}_*` 接收 j_r 和 j_bits（j 为 0 时无参数） */
 
-/* parameter 1: j can be zero */
+/* 后缀 1：允许 j == 0 */
 static void sd_fft_base_8_1(const sd_fft_ctx_t Q, double* x, ulong j) {
     ulong j_bits, j_r;
 
@@ -510,7 +530,7 @@ static void sd_fft_base_8_1(const sd_fft_ctx_t Q, double* x, ulong j) {
         sd_fft_basecase_8_0(Q, x, j_r, j_bits);
 }
 
-/* parameter 0: j cannot be zero */
+/* 后缀 0：j 必须非零 */
 static void sd_fft_base_8_0(const sd_fft_ctx_t Q, double* x, ulong j) {
     ulong j_bits, j_r;
 
@@ -536,18 +556,17 @@ static void sd_fft_base_9_1(const sd_fft_ctx_t Q, double* x, ulong j) {
 }
 
 
-/**************** forward butterfly with truncation **************************/
+/**************** 带截断的基 4 蝶形（块级） ************************************/
 
 /*
-    Let `D = X1-X0`, measured in `double` entries. Assume `D = X2-X1 = X3-X2` and `D >= BLK_SZ`.
-    `sd_fft_moth_trunc_block_{itrunc}_{otrunc}_{j_is_zero}` computes a possibly
-    truncated 2-layer transform with lengths (4*D, 2*D) and mask (0..BLK_SZ).
-    Only the first `itrunc` blocks are read (`2 <= itrunc <= 4`),
-    missing input blocks are treated as zero, and only the first `otrunc` output
-    blocks are written (`1 <= otrunc <= 4`).
+    设 `D = X1-X0`（以 double 计），且 D = X2-X1 = X3-X2 >= BLK_SZ。
+    `sd_fft_moth_trunc_block_{itrunc}_{otrunc}_{j_is_zero}` 计算一个
+    可截断的两层变换，层长 (4*D, 2*D)，掩码 (0..BLK_SZ)。
+    只读前 `itrunc` 个输入块（2 <= itrunc <= 4），缺失的块按零处理；
+    只写前 `otrunc` 个输出块（1 <= otrunc <= 4）。
 */
 
-/* third parameter is j == 0 */
+/* 第三个参数（模板实参）表示 j 是否为 0：j=0 的版本省掉查表乘法 */
 #define DEFINE_IT(itrunc, otrunc) \
 static void CAT4(sd_fft_moth_trunc_block, itrunc, otrunc, 1)( \
     const sd_fft_ctx_t Q, \
@@ -630,11 +649,13 @@ DEFINE_IT(4, 3)
 DEFINE_IT(4, 4)
 #undef DEFINE_IT
 
-/************************ the recursive stuff ********************************/
+/************************ 递归部分 ******************************************/
 
 /*
-    Compute an untruncated k-layer transform with lengths
-    (BLK_SZ*S*2^k, BLK_SZ*S*2^(k-1), ..., BLK_SZ*S*2) and mask (0..BLK_SZ).
+    计算不截断的 k 层变换，各层长度为
+    (BLK_SZ*S*2^k, BLK_SZ*S*2^(k-1), ..., BLK_SZ*S*2)，掩码 (0..BLK_SZ)。
+    S 是块间跨距；k > 4 时按 k1 = k/2、k2 = k - k1 四步分解（先列后行），
+    落到 k <= 4 后直接展开蝶形循环。
 */
 static void sd_fft_no_trunc_block(
     const sd_fft_ctx_t Q,
@@ -655,7 +676,7 @@ static void sd_fft_no_trunc_block(
             sd_fft_no_trunc_block(Q, x + BLK_SZ*(a*S), S<<k2, k1, j);
         } while (a++, a < l2);
 
-        /* row ffts */
+        /* 行变换 */
         ulong l1 = n_pow2(k1);
         ulong b = 0; do {
             sd_fft_no_trunc_block(Q, x + BLK_SZ*((b<<k2)*S), S, k2, (j<<k1) + b);
@@ -672,7 +693,7 @@ static void sd_fft_no_trunc_block(
         ulong k2 = k - k1;
         ulong l2 = n_pow2(k2);
 
-        /* column ffts */
+        /* 列变换 */
         if (j_bits == 0)
         {
             RADIX_4_FORWARD_PARAM_J_IS_Z(VECND, Q)
@@ -703,7 +724,7 @@ static void sd_fft_no_trunc_block(
         if (l2 == 1)
             return;
 
-        /* row ffts */
+        /* 行变换 */
         ulong l1 = n_pow2(k1);
         ulong b = 0; do {
             sd_fft_no_trunc_block(Q, x + BLK_SZ*((b<<k2)*S), S, k2, (j<<k1) + b);
@@ -731,8 +752,9 @@ static void sd_fft_no_trunc_block(
 }
 
 /*
-    Computes an untruncated (LG_BLK_SZ + k)-layer contiguous transform with
-    lengths (BLK_SZ*2^k, BLK_SZ*2^(k-1), ..., BLK_SZ, BLK_SZ/2, ..., 2).
+    计算不截断的 (LG_BLK_SZ + k) 层连续变换，各层长度为
+    (BLK_SZ*2^k, BLK_SZ*2^(k-1), ..., BLK_SZ, BLK_SZ/2, ..., 2)：
+    块间层走 sd_fft_no_trunc_block，块内层落到 sd_fft_base_{8,9}。
 */
 static void sd_fft_no_trunc_internal(
     const sd_fft_ctx_t Q,
@@ -745,13 +767,13 @@ static void sd_fft_no_trunc_internal(
         ulong k1 = k/2;
         ulong k2 = k - k1;
 
-        /* column ffts */
+        /* 列变换 */
         ulong l2 = n_pow2(k2);
         ulong a = 0; do {
             sd_fft_no_trunc_block(Q, x + BLK_SZ*a, n_pow2(k2), k1, j);
         } while (a++, a < l2);
 
-        /* row ffts */
+        /* 行变换 */
         ulong l1 = n_pow2(k1);
         ulong b = 0; do {
             sd_fft_no_trunc_internal(Q, x + BLK_SZ*(b<<k2), k2, (j<<k1) + b);
@@ -762,7 +784,7 @@ static void sd_fft_no_trunc_internal(
 
     if (k == 2)
     {
-        /* k1 = 2; k2 = 0 */
+        /* k1 = 2; k2 = 0：只剩块内层 */
         sd_fft_no_trunc_block(Q, x, 1, 2, j);
         sd_fft_base_8_1(Q, x + BLK_SZ*0, 4*j + 0);
         sd_fft_base_8_0(Q, x + BLK_SZ*1, 4*j + 1);
@@ -781,6 +803,9 @@ static void sd_fft_no_trunc_internal(
 }
 
 
+/* sd_fft_no_trunc_block 的截断版：只处理前 itrunc 个输入块
+   （其余视为零）、只产出前 otrunc 个输出块。
+   k > 2 时同样按 k1/k2 分解，子问题的截断量由位段拆出 */
 static void sd_fft_trunc_block(
     const sd_fft_ctx_t Q,
     double* x,
@@ -846,15 +871,15 @@ static void sd_fft_trunc_block(
         ulong n1p = n1 + (n2 != 0);
         ulong z2p = n_min(l2, itrunc);
 
-        /* columns */
+        /* 列变换（半截断） */
         for (ulong a = 0; a < z2p; a++)
             sd_fft_trunc_block(Q, x + BLK_SZ*(a*S), S << k2, k1, j, z1 + (a < z2), n1p);
 
-        /* full rows */
+        /* 完整行 */
         for (ulong b = 0; b < n1; b++)
             sd_fft_trunc_block(Q, x + BLK_SZ*(b*(S << k2)), S, k2, (j << k1) + b, z2p, l2);
 
-        /* last partial row */
+        /* 最后一段不完整的行 */
         if (n2 > 0)
             sd_fft_trunc_block(Q, x + BLK_SZ*(n1*(S << k2)), S, k2, (j << k1) + n1, z2p, n2);
 
@@ -905,6 +930,7 @@ static void sd_fft_trunc_block(
 }
 
 
+/* sd_fft_no_trunc_internal 的截断版（截断单位为块） */
 static void sd_fft_trunc_internal(
     const sd_fft_ctx_t Q,
     double* x,      /* x = data + BLK_SZ*I  where I = starting index */
@@ -949,15 +975,15 @@ static void sd_fft_trunc_internal(
         ulong n1p = n1 + (n2 != 0);
         ulong z2p = n_min(l2, itrunc);
 
-        /* columns */
+        /* 列变换（半截断） */
         for (ulong a = 0; a < z2p; a++)
             sd_fft_trunc_block(Q, x + BLK_SZ*a, n_pow2(k2), k1, j, z1 + (a < z2), n1p);
 
-        /* full rows */
+        /* 完整行 */
         for (ulong b = 0; b < n1; b++)
             sd_fft_trunc_internal(Q, x + BLK_SZ*(b << k2), k2, (j << k1) + b, z2p, l2);
 
-        /* last partial row */
+        /* 最后一段不完整的行 */
         if (n2 > 0)
             sd_fft_trunc_internal(Q, x + BLK_SZ*(n1 << k2), k2, (j << k1) + n1, z2p, n2);
 
@@ -985,22 +1011,21 @@ static void sd_fft_trunc_internal(
     }
 }
 
-/********************* interface functions ***********************/
+/********************* 对外接口 *********************************************/
 
 /*
-Compute a truncated FFT in place in `d`, assuming all terms after the first `itrunc`
-are zero.
+    就地计算 d 的截断 FFT，假设第 itrunc 项之后的输入全为零。
 
-The output satisfies
-    eval_poly(in_data, sd_fft_ctx_w(Q, i)) = out_data[sd_fft_ctx_trunc_index(L, i)]
-for all `0 <= i < otrunc`. This invariant is tested in `test/t-sd_fft.c`.
-Usually, it only makes sense to have `otrunc >= itrunc` and `n_max(itrunc, otrunc) >= 2^(L-1)`.
-The array `d` needs to have size at least `2^L`.
+    输出满足（输出按位翻转序排布）
+        eval_poly(in_data, sd_fft_ctx_w(Q, i)) = out_data[revbin(i, L)]
+    对所有 0 <= i < otrunc 成立（该不变式由 fsd_test.c 校验）。
+    通常只在 otrunc >= itrunc 且 max(itrunc, otrunc) >= 2^(L-1) 时有意义。
+    d 的长度必须至少为 2^L。
 */
 void sd_fft_trunc(
     sd_fft_ctx_t Q,
     double* d,
-    ulong L,    /* convolution length 2^L */
+    ulong L,    /* 卷积长度 2^L */
     ulong itrunc, ulong otrunc)
 {
     FSD_ASSERT(itrunc <= n_pow2(L));
@@ -1012,9 +1037,10 @@ void sd_fft_trunc(
     {
         ulong new_itrunc, new_otrunc;
 
+        /* 截断量换算成块数（向上取整），块间走递归层 */
         new_itrunc = n_cdiv(itrunc, BLK_SZ);
         new_otrunc = n_cdiv(otrunc, BLK_SZ);
-        /* this isn't very clever */
+        /* 把 itrunc 到块边界之间的尾巴清零 */
         for (int i = 0; i < (int)((-(ulong)itrunc)&(BLK_SZ-1)); i++)
             d[itrunc+i] = 0.0;
 
@@ -1022,11 +1048,11 @@ void sd_fft_trunc(
         return;
     }
 
-    /* neither is this */
+    /* L <= LG_BLK_SZ：块内直接清零 + basecase */
     for (ulong i = itrunc; i < (1<<L); i++)
         d[i] = 0;
 
-    /* L=8 reads from w2tab[7] */
+    /* L=8 会读到 w2tab[7]，初始化已保证连续建到第 9 张表 */
     FSD_ASSERT(LG_BLK_SZ <= SD_FFT_CTX_W2TAB_INIT);
 
     switch (L) {

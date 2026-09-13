@@ -15,7 +15,7 @@
 #define VECMOP(op) vec4d_##op
 
 
-/************************** inverse butterfly *********************************
+/************************** 逆向基 2 蝶形 ***********************************
     2*a0 =      (b0 + b1)
     2*a1 = w^-1*(b0 - b1)
     W := -w^-1
@@ -55,12 +55,17 @@
     V##_store(X1, y1); \
 }
 
+/* 经由 __VA_ARGS__ 转发一层：先把 VECND 展开成 vec8d，再进入上面的
+   V##_xxx 拼接（## 会抑制参数展开，直接调用会拼出未定义的 VECND_xxx） */
 #define _RADIX_2_REVERSE_PARAM_J_IS_Z(...)  RADIX_2_REVERSE_PARAM_J_IS_Z(__VA_ARGS__)
 #define _RADIX_2_REVERSE_MOTH_J_IS_Z(...)   RADIX_2_REVERSE_MOTH_J_IS_Z(__VA_ARGS__)
 #define _RADIX_2_REVERSE_PARAM_J_IS_NZ(...) RADIX_2_REVERSE_PARAM_J_IS_NZ(__VA_ARGS__)
 #define _RADIX_2_REVERSE_MOTH_J_IS_NZ(...)  RADIX_2_REVERSE_MOTH_J_IS_NZ(__VA_ARGS__)
 
-/****************** inverse butterfly with truncation ************************/
+/****************** 带截断的逆向蝶形（radix 2） ********************************
+   命名 radix_2_moth_inv_trunc_block_{n}_{z}_{f}：读取 z 个块、写回 n 个块，
+   f = 1 时再额外写一个块（截断逆变换需要“多算一项”的情形，部分结果带 /2）；
+   具体公式见各函数前的注释。非法组合（正变换根本不会产生）直接报错。 */
 
 /* 未实现的非法组合：直接报错 */
 
@@ -206,7 +211,7 @@ static void radix_2_moth_inv_trunc_block_0_1_1(
     FSD_ASSERT(i == BLK_SZ);
 }
 
-/************************* inverse butterfly **********************************
+/************************* 逆向基 4 蝶形 *************************************
     4*a0 =            (b0 + b1) +        (b2 + b3)
     4*a1 =       w^-1*(b0 - b1) - i*w^-1*(b2 - b3)
     4*a2 = w^-2*(     (b0 + b1) -        (b2 + b3))
@@ -214,7 +219,7 @@ static void radix_2_moth_inv_trunc_block_0_1_1(
     W  := -w^-1
     W2 := -w^-2
     IW := i*w^-1
-*/
+（表里存的是正向根 w，这里通过镜像下标 j_mr 取出 -w^-1 等负逆元）*/
 #define RADIX_4_REVERSE_PARAM_J_IS_Z(V, Q) \
     V IW = V##_set_d(Q->w2tab[0][1]); \
     V n    = V##_set_d(Q->p); \
@@ -274,12 +279,13 @@ static void radix_2_moth_inv_trunc_block_0_1_1(
     V##_store(X3, x3); \
 }
 
+/* 作用同上：强制先展开 VECND 再拼接 */
 #define _RADIX_4_REVERSE_PARAM_J_IS_Z(...)  RADIX_4_REVERSE_PARAM_J_IS_Z(__VA_ARGS__)
 #define _RADIX_4_REVERSE_MOTH_J_IS_Z(...)   RADIX_4_REVERSE_MOTH_J_IS_Z(__VA_ARGS__)
 #define _RADIX_4_REVERSE_PARAM_J_IS_NZ(...) RADIX_4_REVERSE_PARAM_J_IS_NZ(__VA_ARGS__)
 #define _RADIX_4_REVERSE_MOTH_J_IS_NZ(...)  RADIX_4_REVERSE_MOTH_J_IS_NZ(__VA_ARGS__)
 
-
+/* 寄存器内的 2 点逆小变换：j 任意 / j = 0 */
 #define LENGTH2INV_ANY_J(T, x0, x1, n, ninv, w0) \
 { \
    T Z0 = x0, Z1 = x1; \
@@ -294,6 +300,8 @@ static void radix_2_moth_inv_trunc_block_0_1_1(
    x1 = T##_##reduce_to_pm1n(T##_##sub(Z0, Z1), n, ninv); \
 }
 
+/* 寄存器内的 4 点逆小变换：j 任意（w0、ww0、ww1 为对应的逆扭转）
+   与 j = 0（大部分扭转退化为 reduce） */
 #define LENGTH4INV_ANY_J(T, x0, x1, x2, x3, n, ninv, w0, ww0, ww1) \
 { \
     T X0 = x0, X1 = x1, X2 = x2, X3 = x3, Y0, Y1, Y2, Y3, Z0, Z1, Z2, Z3; \
@@ -330,6 +338,7 @@ static void radix_2_moth_inv_trunc_block_0_1_1(
     x3 = T##_##add(Y2, Y3); \
 }
 
+/* 寄存器内的 8 点逆小变换：先 4 个 2 点、再 2 个 4 点（j 任意 / j = 0） */
 #define LENGTH8INV_ANY_J(T, x0, x1, x2, x3, x4, x5, x6, x7, n, ninv, w0, ww0, ww1, www0, www1, www2, www3) \
 { \
     T A0 = x0, A1 = x1, A2 = x2, A3 = x3, A4 = x4, A5 = x5, A6 = x6, A7 = x7; \
@@ -368,8 +377,9 @@ static void radix_2_moth_inv_trunc_block_0_1_1(
     x7 = A7; \
 }
 
-/************ basecase inverse transform of size dividing BLK_SZ *****************/
+/************ 长度不超过 BLK_SZ 的 basecase 逆变换 **************************/
 
+/* 长度 1：空操作 */
 static void sd_ifft_basecase_0_1(const sd_fft_ctx_t FSD_UNUSED(Q), double* FSD_UNUSED(X)) {
 }
 
@@ -543,7 +553,9 @@ static void sd_ifft_basecase_5_0(const sd_fft_ctx_t Q, double* X, ulong j_mr, ul
 }
 
 
-/* use with n = m-2 and m >= 6 */
+/* 由 n = m-2 层的 basecase 递推 m 层（m >= 6）：
+   先递归四段（注意与正向相反，镜像下标取 4*j_mr+{3,2,1,0}），
+   最后做一层基 4 逆向蝶形合并 */
 #define EXTEND_BASECASE(n, m) \
 static void CAT3(sd_ifft_basecase, m, 1)(const sd_fft_ctx_t Q, double* X) \
 { \
@@ -583,7 +595,7 @@ EXTEND_BASECASE(6, 8)
 EXTEND_BASECASE(7, 9)
 #undef EXTEND_BASECASE
 
-/* parameter 1: j can be zero */
+/* 后缀 1：允许 j == 0 */
 static void sd_ifft_base_8_1(const sd_fft_ctx_t Q, double* x, ulong j) {
     ulong j_bits, j_mr;
 
@@ -595,7 +607,7 @@ static void sd_ifft_base_8_1(const sd_fft_ctx_t Q, double* x, ulong j) {
         sd_ifft_basecase_8_0(Q, x, j_mr, j_bits);
 }
 
-/* parameter 0: j cannot be zero */
+/* 后缀 0：j 必须非零 */
 static void sd_ifft_base_8_0(const sd_fft_ctx_t Q, double* x, ulong j) {
     ulong j_bits, j_mr;
 
@@ -618,9 +630,10 @@ static void sd_ifft_base_9_1(const sd_fft_ctx_t Q, double* x, ulong j) {
 }
 
 
-/***************** inverse butterfy with truncation **************************/
-
-/* the legal function are opt-in, and illegal/unimplemented are NULL */
+/***************** 带截断的逆向基 4 蝶形 *************************************
+   命名 radix_4_moth_inv_trunc_block_{n}_{z}_{f} 与 radix_2 版一致：
+   读取 z 个块、写回 n 个块，f = 1 时额外写一个块。
+   合法组合显式实现，正变换不会产生的非法组合以 NULL 占位、查表跳过。 */
 
 #define radix_4_moth_inv_trunc_block_0_1_0 NULL
 #define radix_4_moth_inv_trunc_block_0_1_1 NULL
@@ -1171,8 +1184,9 @@ static void radix_4_moth_inv_trunc_block_0_4_1(
     FSD_ASSERT(i == BLK_SZ);
 }
 
-/************************ the recursive stuff ********************************/
+/************************ 递归部分 ******************************************/
 
+/* 不截断的 k 层块间逆变换（先递归行、后蝶形列，与正向顺序相反） */
 static void sd_ifft_no_trunc_block(
     const sd_fft_ctx_t Q,
     double* x,
@@ -1187,13 +1201,13 @@ static void sd_ifft_no_trunc_block(
         ulong k1 = k/2;
         ulong k2 = k - k1;
 
-        /* row ffts */
+        /* 行变换 */
         ulong l1 = n_pow2(k1);
         ulong b = 0; do {
             sd_ifft_no_trunc_block(Q, x + BLK_SZ*((b<<k2)*S), S, k2, (j<<k1) + b);
         } while (b++, b < l1);
 
-        /* column ffts */
+        /* 列变换 */
         ulong l2 = n_pow2(k2);
         ulong a = 0; do {
             sd_ifft_no_trunc_block(Q, x + BLK_SZ*(a*S), S<<k2, k1, j);
@@ -1246,6 +1260,7 @@ static void sd_ifft_no_trunc_block(
     }
 }
 
+/* 不截断的 (LG_BLK_SZ + k) 层连续逆变换：块内走 basecase，块间走 no_trunc_block */
 static void sd_ifft_no_trunc_internal(
     const sd_fft_ctx_t Q,
     double* x,
@@ -1272,7 +1287,7 @@ static void sd_ifft_no_trunc_internal(
 
     if (k == 2)
     {
-        /* k1 = 2; k2 = 0 */
+        /* k1 = 2; k2 = 0：只剩块内层 */
         sd_ifft_base_8_1(Q, x + BLK_SZ*0, 4*j+0);
         sd_ifft_base_8_0(Q, x + BLK_SZ*1, 4*j+1);
         sd_ifft_base_8_0(Q, x + BLK_SZ*2, 4*j+2);
@@ -1289,6 +1304,8 @@ static void sd_ifft_no_trunc_internal(
     }
 }
 
+/* no_trunc_block 的截断版：z/n/f 分别是（以块计的）读取截断、
+   写回截断与“多写一个块”标志，k <= 2 时查表调用上面的特化蝶形 */
 static void sd_ifft_trunc_block(
     const sd_fft_ctx_t Q,
     double* x,  /* data + BLK_SZ*I */
@@ -1351,19 +1368,19 @@ static void sd_ifft_trunc_block(
         ulong m = n_min(n2, z2);
         ulong mp = n_max(n2, z2);
 
-        /* complete rows */
+        /* 完整行 */
         for (ulong b = 0; b < n1; b++)
             sd_ifft_no_trunc_block(Q, x + BLK_SZ*(b*(S << k2)), S, k2, (j << k1) + b);
 
-        /* rightmost columns */
+        /* 右侧列（输出截断内的部分） */
         for (ulong a = n2; a < z2p; a++)
             sd_ifft_trunc_block(Q, x + BLK_SZ*(a*S), S << k2, k1, j, z1 + (a < mp), n1, fp);
 
-        /* last partial row */
+        /* 最后一段不完整的行 */
         if (fp)
             sd_ifft_trunc_block(Q, x + BLK_SZ*(n1*(S << k2)), S, k2, (j << k1) + n1, z2p, n2, f);
 
-        /* leftmost columns */
+        /* 左侧列（输出截断外的部分，只需算出额外的半行） */
         for (ulong a = 0; a < n2; a++)
             sd_ifft_trunc_block(Q, x + BLK_SZ*(a*S), S << k2, k1, j, z1 + (a < m), n1 + 1, 0);
 
@@ -1387,6 +1404,7 @@ static void sd_ifft_trunc_block(
 }
 
 
+/* no_trunc_internal 的截断版（截断单位为块） */
 static void sd_ifft_trunc_internal(
     const sd_fft_ctx_t Q,
     double* x,  /* x = data + BLK_SZ*I  where I = starting index */
@@ -1422,19 +1440,19 @@ static void sd_ifft_trunc_internal(
         ulong m = n_min(n2, z2);
         ulong mp = n_max(n2, z2);
 
-        /* complete rows */
+        /* 完整行 */
         for (ulong b = 0; b < n1; b++)
             sd_ifft_no_trunc_internal(Q, x + BLK_SZ*(b << k2), k2, (j << k1) + b);
 
-        /* rightmost columns */
+        /* 右侧列（输出截断内的部分） */
         for (ulong a = n2; a < z2p; a++)
             sd_ifft_trunc_block(Q, x + BLK_SZ*a, n_pow2(k2), k1, j, z1 + (a < mp), n1, fp);
 
-        /* last partial row */
+        /* 最后一段不完整的行 */
         if (fp)
             sd_ifft_trunc_internal(Q, x + BLK_SZ*(n1 << k2), k2, (j << k1) + n1, z2p, n2, f);
 
-        /* leftmost columns */
+        /* 左侧列（输出截断外的部分，只需算出额外的半行） */
         for (ulong a = 0; a < n2; a++)
             sd_ifft_trunc_block(Q, x + BLK_SZ*a, n_pow2(k2), k1, j, z1 + (a < m), n1 + 1, 0);
 
@@ -1465,12 +1483,13 @@ static void sd_ifft_trunc_internal(
 }
 
 
-/********************* interface functions ***********************/
+/********************* 对外接口 *********************************************/
 
 /*
-Truncated inverse Fourier transform, inverse of sd_fft_trunc, assume the entries
-past `trunc` first entries of the _output_ are zero. See [vdH2004]_.
-The array `d` need to have size at least `n_pow2(L)`.
+    截断逆 FFT：sd_fft_trunc 的逆变换，假设输出的第 trunc 项之后全为零
+    （截断逆变换算法见 van der Hoeven 2004 / David Harvey）。
+    结果是 2^L * 原序列（幂因子由调用方在点乘中预先除掉）。
+    d 的长度必须至少为 n_pow2(L)。
 */
 void sd_ifft_trunc(
     sd_fft_ctx_t Q,

@@ -1,16 +1,23 @@
+// sd_fft_ctx：单个 ~50 bit NTT 素数的旋转因子表（w2tab）的建立与按需扩展
+//
+// 移植自 FLINT src/fft_small/sd_fft_ctx.c（LGPL-3.0-or-later）。
+
 #include <stdio.h>
 #include "fsd.h"
 
 void sd_fft_ctx_clear(sd_fft_ctx_t Q) {
     ulong k;
+    /* w2tab[0] 指向的缓冲区连续存放前 SD_FFT_CTX_W2TAB_INIT 张表，一次释放；
+       其余表各自独立分配 */
     fsd_aligned_free(Q->w2tab[0]);
     for (k = SD_FFT_CTX_W2TAB_INIT; k < SD_FFT_CTX_W2TAB_SIZE; k++)
         fsd_aligned_free(Q->w2tab[k]);
 }
 
 /*
-    Return a primitive 2^depth-th root modulo the prime pp.
-    Requires depth == valuation(pp - 1, 2).
+    返回模素数 pp 的一个 2^depth 次本原根。
+    要求 depth == v2(pp - 1)（pp - 1 恰好被 2 整除 depth 次）：
+    取一个二次非剩余 a，则 a^((pp-1)/2^depth) 即为所求。
 */
 static ulong sd_fft_ctx_primitive_2power_root(ulong pp, ulong depth, nmod_t mod) {
     ulong a = n_quadratic_nonresidue(pp);
@@ -18,8 +25,8 @@ static ulong sd_fft_ctx_primitive_2power_root(ulong pp, ulong depth, nmod_t mod)
 }
 
 /*
-    Return the primitive 2^(k+1)-th root used to generate w2tab[k].
-    Requires depth == valuation(Q->mod.n - 1, 2).
+    返回生成 w2tab[k] 所用的 2^(k+1) 次本原根。
+    要求 depth == v2(Q->mod.n - 1)。
 */
 static ulong sd_fft_ctx_w2tab_root(const sd_fft_ctx_t Q, ulong depth, ulong k) {
     FSD_ASSERT(k + 1 <= depth);
@@ -27,10 +34,10 @@ static ulong sd_fft_ctx_w2tab_root(const sd_fft_ctx_t Q, ulong depth, ulong k) {
 }
 
 /*
-    Initialize FFT context.
-    pp is a prime with at most ~ 50 bits (exactly representable with a `double`)
-    such that pp - 1 has sufficiently high 2-valuation.
-    Used in sd_fft_trunc, sd_ifft_trunc, sd_fft_ctx_point_mul, etc.
+    初始化 FFT 上下文。
+    pp 是一个不超过约 50 bit 的素数（可用 double 精确表示），
+    且 pp - 1 的 2 进制赋值足够高（能支撑所需深度的变换）。
+    建好的表供 sd_fft_trunc / sd_ifft_trunc 等使用。
 */
 void sd_fft_ctx_init_prime(sd_fft_ctx_t Q, ulong pp) {
     ulong N, i, k, l, init_depth, two_power_depth;
@@ -55,15 +62,14 @@ void sd_fft_ctx_init_prime(sd_fft_ctx_t Q, ulong pp) {
     ninv = Q->pinv;
 
     /*
-        fill wtab to a depth of init_depth:
-        2^(init_depth-1) entries: 1, e(1/4), e(1/8), e(3/8), ...
+        填 w2tab 到 init_depth 层：
+        共 2^(init_depth-1) 个表项，依次为 1, e(1/4), e(1/8), e(3/8), ...
 
-        Q->w2tab[j] is itself a table of length 2^(j-1) containing 2^(j+1) st
-        roots of unity. More documentation on the layout of w2tab can be found
-        before the definition of SD_FFT_CTX_W2TAB_SIZE.
+        Q->w2tab[j] 本身是长 2^(j-1) 的表，存放 2^(j+1) 次单位根
+        （按 revbin 排列；布局说明另见 SD_FFT_CTX_W2TAB_SIZE 定义处）。
 
-        All entries in w2tab are exactly-representable integers modulo pp, but
-        they're stored as `double` to make use of the vectorized functions.
+        表中所有项都是模 pp 的整数剩余，但以 double 存储，
+        以便直接喂给向量化的模乘原语。
     */
     N = n_pow2(init_depth - 1);
     t = (double*)fsd_aligned_alloc(4096, n_round_up(N * sizeof(double), 4096));
@@ -72,6 +78,7 @@ void sd_fft_ctx_init_prime(sd_fft_ctx_t Q, ulong pp) {
     t[0] = 1;
 
     {
+        /* 前几张表手工铺：w 是当前层的 8 次本原根（e(1/8) 方向） */
         ulong ww = sd_fft_ctx_w2tab_root(Q, two_power_depth, 3);
         w = vec1d_reduce_0n_to_pmhn(ww, n);
         double w2 = vec1d_reduce_pm1n_to_pmhn(vec1d_mulmod(w, w, n, ninv), n);
@@ -87,6 +94,7 @@ void sd_fft_ctx_init_prime(sd_fft_ctx_t Q, ulong pp) {
     vec4d n4 = vec4d_set_d(n);
     vec4d ninv4 = vec4d_set_d(ninv);
 
+    /* k >= 3 的表：第 k 层 = 第 k-1 层整体乘以该层的本原根 w */
     for (k = 3, l = 4; k < init_depth; k++, l *= 2) {
         double* curr = t + l;
         vec4d w4 = vec4d_set_d(w);
@@ -105,11 +113,12 @@ void sd_fft_ctx_init_prime(sd_fft_ctx_t Q, ulong pp) {
 
     Q->w2tab_depth = (unsigned int)k;
 
-    /* the rest of the tables are uninitialized */
+    /* 其余表指针置空，待 fit_depth 按需建立 */
     for (; k < SD_FFT_CTX_W2TAB_SIZE; k++)
         Q->w2tab[k] = NULL;
 
 #ifndef NDEBUG
+    /* 调试版逐项核对：w2tab[k][i] 应等于 root^revbin(i + 2^(k-1), k) */
     for (k = 1; k < init_depth; k++) {
         ulong ww = sd_fft_ctx_w2tab_root(Q, two_power_depth, k);
         for (i = 0; i < n_pow2(k - 1); i++) {
@@ -120,12 +129,13 @@ void sd_fft_ctx_init_prime(sd_fft_ctx_t Q, ulong pp) {
 #endif
 }
 
+/*
+    保证 w2tab 已建到 depth 层：不足则从当前 w2tab_depth 逐层扩展。
+    每张新表独立分配（4 KB 对齐），由低层表整体乘以新本原根得到。
+    （FLINT 原版的 fit_depth_with_lock 在多线程下加锁扩展，本移植为
+     单线程，直接合并为一个函数。）
+*/
 void sd_fft_ctx_fit_depth(sd_fft_ctx_t Q, ulong depth) {
-    if (depth > Q->w2tab_depth)
-        sd_fft_ctx_fit_depth_with_lock(Q, depth);
-}
-
-void sd_fft_ctx_fit_depth_with_lock(sd_fft_ctx_t Q, ulong depth) {
     ulong two_power_depth = n_trailing_zeros(Q->mod.n - 1);
 
     if (depth > two_power_depth)
@@ -144,7 +154,8 @@ void sd_fft_ctx_fit_depth_with_lock(sd_fft_ctx_t Q, ulong depth) {
         double* t = Q->w2tab[0];
         Q->w2tab[k] = curr;
 
-        /* The first few tables are stored consecutively, so vec16 is ok. */
+        /* 前几张表在 w2tab[0] 的缓冲区里连续存放，先整体拷贝乘 w，
+           再逐张（已建好的）旧表做同样的「乘 w」得到新表的对应段 */
         off = 0;
         l = n_pow2(SD_FFT_CTX_W2TAB_INIT - 1);
         for (j = SD_FFT_CTX_W2TAB_INIT - 1; j < k; j++) {

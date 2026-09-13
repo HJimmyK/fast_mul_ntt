@@ -7,7 +7,7 @@
 #include <stdlib.h>
 #include <time.h>
 
-#include "../fft_small/fft_small.h"
+#include "fft_small.h"
 
 static long long measure_real_time(long long len1, long long len2) {
     u64* in1 = (u64*)malloc(len1 * sizeof(u64));
