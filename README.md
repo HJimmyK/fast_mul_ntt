@@ -39,7 +39,7 @@ cmake -B build && cmake --build build
 
 两个库导出同名接口、基准测试的扫描方式一致（同尺寸序列、每点 3 次取平均），`cc_ntt-crt_times.csv` 与 `cc_fft_small_times.csv` 可直接对画。算法层面的差异：
 
-| 维度 | `src/`（自研） | `fft_small/`（FLINT 移植） |
+| 维度 | `src/`（3ntt_crt） | `fft_small/`（FLINT 移植） |
 |------|----------------|---------------------------|
 | 剩余系表示 | 三个 < 2^62 的 NTT 素数，u64 整数运算 | 4~8 个 ~2^50 素数，剩余用 double 表示 |
 | 模乘 | `mulx` 128 位乘 + 蒙哥马利约减（R = 2^64） | FMA 的 double-double 同余乘法（依赖严格舍入语义，禁用 `-ffast-math`） |
@@ -55,7 +55,7 @@ cmake -B build && cmake --build build
 
 > 注意：两个库导出同名符号，链接时二选一，不能同时链入。
 
-## 3NTT（src/）
+## 3NTT-CRT（src/）
 
 基于数论变换（NTT）与三模数中国剩余定理（CRT）的**大整数乘法**快速实现，纯 C11 编写。
 
@@ -80,7 +80,7 @@ cmake -B build && cmake --build build
 
 ```
 .
-├── src/                自研核心源码（不含任何测试代码）
+├── src/                核心源码（不含任何测试代码）
 │   ├── fast_mul.h          对外 API：abs_mul64 / abs_sqr64
 │   ├── fast_mul.c          卷积核（conv_rec / conv_single / conv_sqr）与顶层实现
 │   ├── core.h              NTT 正/逆变换：蝶形宏、旋转因子表、crt3
@@ -98,7 +98,7 @@ cmake -B build && cmake --build build
 │   ├── fsd_crt.h           CRT 大数乘加/缩减模板
 │   └── fsd_test.c          正确性自测
 ├── bench/              基准测试
-│   ├── bench.c             自研版长度扫描计时（cc_ntt-crt_times.csv）
+│   ├── bench.c             长度扫描计时（cc_ntt-crt_times.csv）
 │   └── bench_fft_small.c   fft_small 版长度扫描计时（cc_fft_small_times.csv）
 ├── CMakeLists.txt
 ├── LICENSE
