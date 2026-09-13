@@ -1,5 +1,40 @@
 # fast_mul_ntt
 
+本仓库包含两套**大整数乘法**实现，接口完全相同（`abs_mul64` / `abs_sqr64`，小端 64 位 limb 数组）：
+
+| 模块 | 来源 | 指令集 | 许可证 |
+|------|------|--------|--------|
+| `src/` | 3 模数 NTT + CRT | x86-64（GNU 内联汇编） | MIT |
+| `fft_small/` | 移植自 [FLINT](https://flintlib.org) 的 fft_small（单线程化） | AVX2 + FMA | LGPL-3.0-or-later |
+
+两套实现的接口约定：
+
+```c
+void abs_mul64(const u64* in1, u64 len1, const u64* in2, u64 len2, u64* out); /* out = in1*in2，长 len1+len2 */
+void abs_sqr64(const u64* in1, u64 len1, u64* out);                          /* out = in1²，长 2*len1 */
+```
+
+> 注意：两个库导出同名符号，链接时二选一。
+
+## fft_small/（FLINT 移植版，AVX2）
+
+从 FLINT 的 `src/fft_small` 提炼移植的通用乘法/平方，**单线程、AVX2、无外部依赖**（不链接 GMP/FLINT 本体）。算法要点：
+
+- **小数域 NTT**：剩余系用 double 表示（约 50 bit 的 NTT 素数），模乘用 FMA 的 double-double 技巧实现（精确同余，边界条件由 `fft_small_mulmod_satisfies_bounds` 校验）；
+- **截断 FFT/IFFT**（van der Hoeven / David Harvey 算法）：按块（256 个 double）组织，行列四步分解 + 基 2/4 蝶形，输入输出均可截断以跳过零填充区；
+- **多素数 CRT**：8 个 NTT 素数按操作数长度自动挑选 4~8 个及分组位数（84~192 bit/组），CRT 余因子与 2 的幂表预计算；
+- **数据规模上限**：较短操作数不超过约 25 亿 limb（约 20 GB），超过时报错退出。
+
+```bash
+cmake -B build && cmake --build build
+./build/fsd_test            # 正确性自测（向量原语 / FFT 往返 / 乘法对拍）
+./build/bench_fft_small.exe # 基准测试（输出 cc_fft_small_times.csv）
+```
+
+`fft_small/` 内的文件移植自 FLINT，保留原始版权声明；`fsd_vec.h`（AVX2 向量原语）与 `fsd_mpn.c`、`fsd_crt.h`（替代 GMP 的小函数）为重写。
+
+## 自研版（src/）
+
 基于数论变换（NTT）与三模数中国剩余定理（CRT）的**大整数乘法**快速实现，纯 C11 编写，无第三方依赖。
 
 ## 算法概要
@@ -23,14 +58,26 @@
 
 ```
 .
-├── src/                核心源码（不含任何测试代码）
+├── src/                自研核心源码（不含任何测试代码）
 │   ├── fast_mul.h          对外 API：abs_mul64 / abs_sqr64
 │   ├── fast_mul.c          卷积核（conv_rec / conv_single / conv_sqr）与顶层实现
 │   ├── core.h              NTT 正/逆变换：蝶形宏、旋转因子表、crt3
 │   ├── data.h              三个 NTT 模数及蒙哥马利域常数
 │   └── macro.h             基础类型、128/192 位运算与蒙哥马利乘宏
+├── fft_small/          FLINT fft_small 移植（单线程 AVX2，LGPL）
+│   ├── fft_small.h/.c      对外 API 与全局上下文
+│   ├── fsd_vec.h           AVX2 向量原语（vec1d/vec4d/vec8d）
+│   ├── fsd_fft.c           截断正变换（sd_fft_trunc）
+│   ├── fsd_ifft.c          截断逆变换（sd_ifft_trunc）
+│   ├── fsd_fft_ctx.c       旋转因子表构建与按深度扩展
+│   ├── fsd_mpn_mul.c       乘法主流程（多素数方案选择、CRT 重构）
+│   ├── fsd_helpers.c       FFT 输出转 limb 等
+│   ├── fsd_mpn.c           mpn/nmod 小函数、素性检测、模乘精度边界
+│   ├── fsd_crt.h           CRT 大数乘加/缩减模板
+│   └── fsd_test.c          正确性自测
 ├── bench/              基准测试
-│   └── bench.c             长度扫描计时程序（输出 CSV）
+│   ├── bench.c             自研版长度扫描计时（cc_ntt-crt_times.csv）
+│   └── bench_fft_small.c   fft_small 版长度扫描计时（cc_fft_small_times.csv）
 ├── CMakeLists.txt
 ├── LICENSE
 └── README.md
@@ -49,8 +96,9 @@ cmake --build build
 
 构建产物（位于 `build/`）：
 
-- 核心静态库（`libfast_mul.a` / `fast_mul.lib`，取决于工具链）；
-- `bench.exe` —— 基准测试程序。
+- `fast_mul` / `fft_small` —— 两个静态库（接口同名，链接时二选一）；
+- `bench`、`bench_fft_small` —— 各自的基准测试程序；
+- `fsd_test` —— fft_small 的正确性自测。
 
 ## 使用示例
 
@@ -82,7 +130,7 @@ gcc -O3 -Isrc my_main.c src/fast_mul.c -o my_app
 ./build/bench.exe
 ```
 
-完整跑完需要较长时间和较大内存（最大尺寸点约需 1 GB 以上）；只想快速验证可以随时 Ctrl+C 中断，已打印的进度数据仍可参考。
+完整运行需要较长时间和较大内存（最大尺寸点约需 1 GB 以上）；只想快速验证可以随时 Ctrl+C 中断，已打印的进度数据仍可参考。
 
 ## 工作原理（abs_mul64 流程）
 

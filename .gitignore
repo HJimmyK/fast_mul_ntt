@@ -1,5 +1,5 @@
 # 构建目录
 build/
-
+.history/
 # 基准测试输出
 *.csv
